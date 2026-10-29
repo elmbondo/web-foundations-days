@@ -108,21 +108,28 @@ The read replica and the object storage each appear more than once so the lines 
 
 ## 7. Upload flow, step by step
 
-1. The user picks a photo and taps Upload. The request goes through the load balancer to an app server, with the user's login token.
-2. The app server checks the token, then checks the file (it must be an image, and not too big).
-3. The app server saves the original photo in object storage and gets back its storage key.
-4. The app server adds a row to the primary database with the photo id, user id, storage key, caption and time. The status is set to "processing".
-5. The app server puts a "make thumbnail" job on the queue with the photo id and storage key.
-6. The app server replies to the user with 201 Created right away, so the user doesn't wait for the thumbnail.
-7. A worker takes the job from the queue, downloads the original, makes a 50 KB thumbnail, and saves it in object storage.
-8. The worker updates the database row with the thumbnail key and sets the status to "ready".
-9. If the worker fails, the job goes back on the queue and is tried again a few times. Meanwhile the photo shows a placeholder.
-10. When followers open their feed, the thumbnails load through the CDN. The feed cache expires after about a minute, so the new photo shows up soon.
+1. The user picks a photo and taps Upload. The request travels through the load balancer to one of the app servers, together with the user's login token.
+2. The app server checks the token to find out who the user is, then checks the file. It must be an image, and it must not be too big. If the file is bad, the app server replies with 400 Bad Request and nothing is saved.
+3. The app server writes the original photo to object storage and gets back its storage key (the file's location).
+4. The app server stores the metadata in the primary database: a new row with the photo id, the user id, the storage key, the caption and the time. The status is set to "processing", and the thumbnail key is empty for now.
+5. The app server pushes a "make thumbnail" job onto the queue. The job holds the photo id and the storage key.
+6. The app server replies to the user with 201 Created right away. The user does not wait for the thumbnail.
+7. A worker takes the job from the queue. It downloads the original photo from object storage and creates a 50 KB thumbnail.
+8. The worker saves the thumbnail in object storage and gets back its storage key.
+9. The worker updates the photo's row in the primary database with the thumbnail key and changes the status to "ready".
+10. If the worker fails at any point, the job goes back on the queue and is tried again a few times. Until it succeeds, the photo shows a placeholder.
+11. When followers open their feed, the thumbnails load through the CDN. The feed cache expires after about a minute, so the new photo shows up soon.
 
 ## 8. Trade-offs
 
-1. **Cache: speed against fresh data.** The cache makes feeds fast and takes load off the database, but the feed can be a little out of date. I use a short expiry (about a minute) so new photos still show up quickly. It also adds one more thing to manage.
-2. **Read replica: less load against delay.** The replica takes the read traffic, but it can lag a moment behind the primary, so a new photo may not show for a second or two. To avoid confusing the uploader, I would show their own new photo straight from the primary.
-3. **Queue and worker: fast upload against a delay.** Uploads feel instant because the thumbnail is made later, but the thumbnail appears a few seconds after the upload. I also have to run, retry and watch the queue and workers.
-4. **Object storage: cheap and huge against two places to keep in sync.** Files are cheap to keep, but the file and its database row can get out of step. For example, the file may be saved but the database write fails. I would run a cleanup job to remove files that have no row.
+1. **Thumbnails made later (asynchronous) against made during the upload (synchronous).** If the app server made the thumbnail before replying, the thumbnail would be ready straight away, but the user would wait longer and a traffic spike would tie up the app servers with slow image work. I chose to use a queue and a worker, so the upload replies fast and the work happens in the background. The cost is that the thumbnail appears a few seconds after the upload, so I need a placeholder, retries, and a way to watch the queue.
+2. **Immediate consistency against low latency (read replica).** The read replica takes the feed traffic off the primary, but it can lag a moment behind, so a new photo may not show for a second or two. Reading everything from the primary would always be up to date, but it would be slower and would overload the primary. I would use the replica for feeds, and read from the primary for a short time after a user uploads, so they always see their own photo.
+3. **Cache: speed against fresh data.** The cache makes feeds fast and protects the database, but a cached feed can be a little out of date. I use a short expiry (about a minute), so new photos still show up quickly. It is also one more thing to run and watch.
+4. **Object storage: cheap and huge against two places to keep in sync.** Files are cheap to keep and the storage grows easily, but the file and its database row can get out of step. For example, the file may be saved but the database write fails. I would run a cleanup job to remove files that have no row.
 5. **CDN: speed against cost.** Photos load much faster, but I pay for the data it delivers, and a deleted photo can stay on the CDN until the cache is cleared.
+
+## 9. Summary
+
+SnapShare is a read-heavy system with about 12 uploads per second and about 579 feed views per second on average, and it adds roughly 750 TB of photos every year. To handle that, photos live in object storage behind a CDN, feeds are served from a cache and a read replica, and slow work like thumbnails is done in the background by workers reading from a queue. The main trade-offs are speed against freshness of data, and fast uploads against thumbnails that appear a few seconds later.
+
+End of plan.
